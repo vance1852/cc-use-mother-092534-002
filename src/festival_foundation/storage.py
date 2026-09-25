@@ -63,6 +63,109 @@ CREATE TABLE IF NOT EXISTS audit_events (
     event_hash TEXT NOT NULL UNIQUE,
     occurred_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS relay_incidents (
+    incident_id TEXT PRIMARY KEY,
+    site_id TEXT NOT NULL REFERENCES sites(site_id),
+    road_code TEXT NOT NULL,
+    title TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 2 CHECK(priority BETWEEN 1 AND 3),
+    status TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    head_revision_id TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    closed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS relay_open_incident_uq
+    ON relay_incidents(site_id, road_code) WHERE status = 'open';
+CREATE TABLE IF NOT EXISTS relay_revisions (
+    revision_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES relay_incidents(incident_id),
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    ordering TEXT NOT NULL CHECK(ordering IN ('in_order', 'late')),
+    applied INTEGER NOT NULL CHECK(applied IN (0, 1)),
+    not_applied_reason TEXT,
+    prev_hash TEXT NOT NULL,
+    revision_hash TEXT NOT NULL,
+    audit_sequence INTEGER,
+    UNIQUE(incident_id, seq),
+    UNIQUE(incident_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS relay_revisions_incident_seq
+    ON relay_revisions(incident_id, seq);
+CREATE TABLE IF NOT EXISTS relay_conditions (
+    incident_id TEXT NOT NULL REFERENCES relay_incidents(incident_id),
+    condition_key TEXT NOT NULL,
+    label TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('open', 'satisfied')),
+    satisfied_revision_id TEXT,
+    satisfied_at TEXT,
+    reopened_at TEXT,
+    PRIMARY KEY(incident_id, condition_key)
+);
+CREATE TABLE IF NOT EXISTS relay_reviews (
+    review_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES relay_incidents(incident_id),
+    revision_id TEXT NOT NULL,
+    reviewer_id TEXT NOT NULL,
+    result TEXT NOT NULL CHECK(result IN ('pass', 'fail')),
+    note TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_leases (
+    lease_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES relay_incidents(incident_id),
+    holder_id TEXT NOT NULL REFERENCES actors(actor_id),
+    status TEXT NOT NULL CHECK(status IN ('active', 'transferred', 'expired', 'completed')),
+    claimed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    transferred_from_lease_id TEXT,
+    note TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_proposals (
+    proposal_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES relay_incidents(incident_id),
+    site_id TEXT NOT NULL REFERENCES sites(site_id),
+    demands_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('proposed', 'confirmed', 'infeasible')),
+    base_version INTEGER NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS relay_proposal_items (
+    proposal_id TEXT NOT NULL REFERENCES relay_proposals(proposal_id),
+    item_index INTEGER NOT NULL,
+    resource_key TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    source TEXT NOT NULL CHECK(source IN ('free', 'borrow', 'shortage')),
+    source_incident_id TEXT,
+    reason TEXT NOT NULL,
+    PRIMARY KEY(proposal_id, item_index)
+);
+CREATE TABLE IF NOT EXISTS relay_allocations (
+    allocation_id TEXT PRIMARY KEY,
+    site_id TEXT NOT NULL,
+    resource_key TEXT NOT NULL,
+    incident_id TEXT NOT NULL REFERENCES relay_incidents(incident_id),
+    status TEXT NOT NULL CHECK(status IN ('reserved', 'occupied', 'released', 'preempted')),
+    proposal_id TEXT NOT NULL REFERENCES relay_proposals(proposal_id),
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    released_at TEXT,
+    release_revision_id TEXT,
+    release_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS relay_active_allocation_uq
+    ON relay_allocations(site_id, resource_key)
+    WHERE status = 'reserved' OR status = 'occupied';
 """
 
 

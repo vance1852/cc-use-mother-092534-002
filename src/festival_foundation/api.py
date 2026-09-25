@@ -9,12 +9,14 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .relay import RelayService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          relay: RelayService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -48,6 +50,9 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        result = _route_relay(relay, method, parsed.path, body, actor_id)
+        if result is not None:
+            return result
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -55,10 +60,50 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+_RELAY_POST_ROUTES = {
+    "/relay/risks": "report_risk",
+    "/relay/actions": "report_action",
+    "/relay/lift-control": "lift_control",
+    "/relay/close": "close_incident",
+    "/relay/leases/claim": "claim_lease",
+    "/relay/leases/transfer": "transfer_lease",
+    "/relay/allocations/plan": "plan_allocation",
+    "/relay/allocations/confirm": "confirm_allocation",
+    "/relay/allocations/acknowledge": "acknowledge_resource",
+    "/relay/reviews/reopen": "reopen_after_review",
+}
+
+
+def _route_relay(relay: RelayService | None, method: str, path: str,
+                 body: dict[str, Any], actor_id: str) -> tuple[int, dict[str, Any]] | None:
+    """分派接力台账相关路由。"""
+
+    if relay is None:
+        return None
+    parts = [segment for segment in path.split("/") if segment]
+    if method == "POST" and path in _RELAY_POST_ROUTES:
+        outcome = getattr(relay, _RELAY_POST_ROUTES[path])(actor_id=actor_id, **body)
+        return 200 if outcome["replayed"] else 201, outcome["response"] | {
+            "replayed": outcome["replayed"],
+            "resource_type": outcome["resource_type"],
+            "resource_id": outcome["resource_id"],
+        }
+    if method == "GET" and len(parts) == 4 and parts[:2] == ["relay", "incidents"] \
+            and parts[3] == "timeline":
+        return 200, relay.incident_timeline(parts[2])
+    if method == "GET" and len(parts) == 4 and parts[:2] == ["relay", "sites"] \
+            and parts[3] == "resources":
+        return 200, relay.resource_trace(parts[2])
+    if parts and parts[0] == "relay":
+        return 404, {"error": "route_not_found", "message": "接力台账接口不存在"}
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    relay: RelayService | None = None
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +114,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                relay=self.relay)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +146,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.relay = RelayService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
