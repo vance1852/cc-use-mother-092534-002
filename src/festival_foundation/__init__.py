@@ -1,5 +1,6 @@
 """节日公共服务协作基础层的服务端基础包。"""
 
 from .service import DomainService
+from .traffic import TrafficRelayService
 
-__all__ = ["DomainService"]
+__all__ = ["DomainService", "TrafficRelayService"]

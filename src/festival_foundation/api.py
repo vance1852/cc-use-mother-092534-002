@@ -11,15 +11,23 @@ from urllib.parse import parse_qs, urlparse
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
+from .traffic import TrafficRelayService
+
+
+def _split_path(path: str) -> list[str]:
+    return [segment for segment in urlparse(path).path.split("/") if segment]
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          traffic: TrafficRelayService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
+    segments = _split_path(path)
+    query = parse_qs(parsed.query)
     actor_id = headers.get("X-Actor-Id", "")
     try:
         if method == "GET" and parsed.path == "/health":
@@ -38,16 +46,18 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             receipt = service.record_domain_data(actor_id=actor_id, **body)
             return 200 if receipt.replayed else 201, receipt.__dict__
         if method == "GET" and parsed.path == "/domain-records":
-            query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
             if not site_id:
                 raise ValidationError("site_id 不能为空")
             category = query.get("category", [None])[0]
             return 200, {"items": [item.__dict__ for item in service.list_domain_data(site_id, category)]}
         if method == "GET" and parsed.path == "/audit-events":
-            query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if segments and segments[0] == "traffic" and traffic is not None:
+            status, payload = _route_traffic(traffic, method, segments, query, body, actor_id)
+            if status is not None:
+                return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -55,10 +65,43 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+def _route_traffic(traffic: TrafficRelayService, method: str, segments: list[str],
+                   query: dict[str, list[str]], body: dict[str, Any], actor_id: str
+                   ) -> tuple[int | None, dict[str, Any]]:
+    """分派交通干线接力台账相关路由。"""
+
+    receipt = None
+    if method == "POST" and segments == ["traffic", "incidents"]:
+        receipt = traffic.report_risk(actor_id=actor_id, **body)
+    elif method == "POST" and segments == ["traffic", "messages"]:
+        receipt = traffic.append_message(actor_id=actor_id, **body)
+    elif method == "POST" and segments == ["traffic", "leases", "claim"]:
+        receipt = traffic.claim_task(actor_id=actor_id, **body)
+    elif method == "POST" and segments == ["traffic", "leases", "transfer"]:
+        receipt = traffic.transfer_task(actor_id=actor_id, **body)
+    elif method == "POST" and segments == ["traffic", "resources"]:
+        receipt = traffic.register_resource(actor_id=actor_id, **body)
+    elif method == "POST" and segments == ["traffic", "allocation-plans"]:
+        receipt = traffic.propose_allocation(actor_id=actor_id, **body)
+    elif method == "POST" and segments == ["traffic", "allocation-plans", "decide"]:
+        receipt = traffic.decide_allocation(actor_id=actor_id, **body)
+    elif method == "GET" and segments == ["traffic", "road-status"]:
+        site_id = query.get("site_id", [None])[0]
+        return 200, {"items": traffic.road_status(site_id)}
+    elif method == "GET" and len(segments) == 3 and segments[1] == "incidents" and segments[2] != "":
+        return 200, traffic.incident_explanation(segments[2])
+    elif method == "GET" and len(segments) == 4 and segments[1] == "resources" and segments[3] == "trace":
+        return 200, traffic.resource_trace(segments[2])
+    else:
+        return None, {}
+    return 200 if receipt.replayed else 201, receipt.__dict__
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    traffic: TrafficRelayService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +112,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                traffic=self.traffic)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +144,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.traffic = TrafficRelayService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
